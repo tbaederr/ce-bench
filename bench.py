@@ -9,6 +9,7 @@ Runs each test file in tests/ through perf stat twice:
 Collects task-clock, instructions, cpu-cycles, and wall time.
 """
 
+import argparse
 import configparser
 import html
 import json
@@ -376,6 +377,31 @@ def find_newest_result(llvm_repo: Path) -> str:
     return proc.stdout.strip().splitlines()[0]
 
 
+def prune_stale_results(llvm_repo: Path):
+    """Remove result files for commits no longer in the repo."""
+    if not RESULTS_DIR.exists():
+        return
+
+    result_files = list(RESULTS_DIR.glob("*.json"))
+    if not result_files:
+        return
+
+    hashes = [p.stem for p in result_files]
+
+    # git cat-file --batch-check tells us which hashes exist.
+    proc = subprocess.run(
+        ["git", "cat-file", "--batch-check"],
+        input="\n".join(hashes),
+        cwd=llvm_repo,
+        capture_output=True, text=True,
+    )
+
+    for path, line in zip(result_files, proc.stdout.strip().splitlines()):
+        if "missing" in line:
+            print(f"Removing stale result: {path.name}")
+            path.unlink()
+
+
 def update_repo(llvm_repo: Path):
     print("Updating llvm repo ...", end="", flush=True)
 
@@ -454,9 +480,12 @@ def generate_html(records: list[RunRecord]):
     test_names = collect_test_names(records)
 
     # Header row: Commit | test1 | test2 | ...
+    TESTS_BASE_URL = "https://github.com/tbaederr/ce-bench/tree/main/tests"
+
     header_cells = "<th>Commit</th>"
     for name in test_names:
-        header_cells += f"<th>{html.escape(name)}</th>"
+        test_url = f"{TESTS_BASE_URL}/{name}.cpp"
+        header_cells += f'<th><a href="{test_url}">{html.escape(name)}</a></th>'
 
     # Records are sorted oldest-first; build per-test instruction counts
     # so we can compute deltas between consecutive commits.
@@ -566,6 +595,11 @@ def run_for_commit(commit: CommitInfo, llvm_repo: Path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Constexpr interpreter benchmarks")
+    parser.add_argument("--update", action="store_true",
+                        help="Update the llvm repo and run benchmarks for new commits")
+    args = parser.parse_args()
+
     config = load_settings()
     llvm_repo = get_llvm_repo(config)
 
@@ -577,26 +611,27 @@ def main():
         print(f"Error: {llvm_repo} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    update_repo(llvm_repo)
+    if args.update:
+        update_repo(llvm_repo)
+        prune_stale_results(llvm_repo)
 
-    first_run = not RESULTS_DIR.exists() or not any(RESULTS_DIR.glob("*.json"))
+        first_run = not RESULTS_DIR.exists() or not any(RESULTS_DIR.glob("*.json"))
 
-    if first_run:
-        new_commits = find_bytecode_commits(llvm_repo, limit=INITIAL_COMMIT_COUNT)
-    else:
-        newest_hash = find_newest_result(llvm_repo)
-        new_commits = find_bytecode_commits(llvm_repo, since=newest_hash)
+        if first_run:
+            new_commits = find_bytecode_commits(llvm_repo, limit=INITIAL_COMMIT_COUNT)
+        else:
+            newest_hash = find_newest_result(llvm_repo)
+            new_commits = find_bytecode_commits(llvm_repo, since=newest_hash)
 
-    if new_commits:
-        print(f"Benchmarking {len(new_commits)} new commit(s):")
-        for c in new_commits:
-            print(f"  {c.hash[:12]} {c.subject}")
-        print()
-        # Oldest first so the HTML report shows progression.
-        for commit in reversed(new_commits):
-            run_for_commit(commit, llvm_repo)
-    else:
-        print("No new commits to benchmark.")
+        if new_commits:
+            print(f"Benchmarking {len(new_commits)} new commit(s):")
+            for c in new_commits:
+                print(f"  {c.hash[:12]} {c.subject}")
+            print()
+            for commit in reversed(new_commits):
+                run_for_commit(commit, llvm_repo)
+        else:
+            print("No new commits to benchmark.")
 
     all_records = load_all_results()
     all_records = sort_by_git_order(llvm_repo, all_records)
