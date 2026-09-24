@@ -485,7 +485,7 @@ def generate_html(records: list[RunRecord]):
     header_cells = "<th>Commit</th>"
     for name in test_names:
         test_url = f"{TESTS_BASE_URL}/{name}.cpp"
-        header_cells += f'<th><a href="{test_url}">{html.escape(name)}</a></th>'
+        header_cells += f'<th class="num"><a href="{test_url}">{html.escape(name)}</a></th>'
 
     # Records are sorted oldest-first; build per-test instruction counts
     # so we can compute deltas between consecutive commits.
@@ -540,22 +540,66 @@ def generate_html(records: list[RunRecord]):
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Constexpr Interpreter Benchmark</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bytecode Interpreter Benchmark</title>
 <style>
-  body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #fafafa; color: #222; font-size: 0.85rem; }}
-  h1 {{ font-size: 1.4rem; margin-bottom: 1.5rem; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 2.5rem;
+    background: #f6f8fa; color: #1f2328;
+    font-size: 0.85rem; line-height: 1.5;
+  }}
+  a {{ text-decoration: none; color: #0969da; }}
+  a:hover {{ text-decoration: underline; }}
+  h1 {{
+    font-size: 1.3rem; font-weight: 600;
+    margin: 0 0 0.4rem 0; color: #1f2328;
+  }}
+  .subtitle {{
+    color: #656d76; font-size: 0.8rem; margin-bottom: 1.5rem;
+  }}
+  .table-wrap {{
+    background: #fff; border: 1px solid #d0d7de; border-radius: 6px;
+    overflow-x: auto;
+  }}
   table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ padding: 0.4rem 0.8rem; border: 1px solid #ddd; text-align: left; white-space: nowrap; }}
-  th {{ background: #f0f0f0; }}
-  td code {{ background: #e8e8e8; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.85em; }}
-  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  th, td {{
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid #d0d7de;
+    text-align: left; white-space: nowrap;
+  }}
+  th {{
+    background: #f6f8fa; color: #656d76;
+    font-weight: 600; font-size: 0.8rem;
+    position: sticky; top: 0;
+  }}
+  tr:last-child td {{ border-bottom: none; }}
+  td code {{
+    background: #eff1f3; padding: 0.15rem 0.4rem;
+    border-radius: 4px; font-size: 0.8em;
+    font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
+  }}
+  .num {{
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
+    font-size: 0.8rem;
+  }}
   .better {{ color: #1a7f37; font-weight: 600; }}
   .worse  {{ color: #cf222e; font-weight: 600; }}
-  .failed {{ color: #888; font-style: italic; }}
+  .failed {{ color: #8b949e; font-style: italic; }}
+  .footer {{
+    margin-top: 1.2rem; font-size: 0.75rem; color: #8b949e;
+  }}
+  .footer a {{ color: #8b949e; }}
+  .footer a:hover {{ color: #656d76; }}
 </style>
 </head>
 <body>
-<h1>Constexpr Interpreter Benchmark — Instructions Delta</h1>
+<h1>Bytecode Interpreter Benchmark</h1>
+<p class="subtitle">instructions:u delta between consecutive commits</p>
+<div class="table-wrap">
 <table>
 <thead>
   <tr>{header_cells}</tr>
@@ -563,6 +607,8 @@ def generate_html(records: list[RunRecord]):
 <tbody>
 {rows}</tbody>
 </table>
+</div>
+<p class="footer"><a href="https://github.com/tbaederr/ce-bench">Source Code</a></p>
 </body>
 </html>
 """
