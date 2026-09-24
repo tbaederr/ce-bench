@@ -459,8 +459,10 @@ REPORT_FILE = SCRIPT_DIR / "report.html"
 
 
 def delta_css_class(pct: float | None) -> str:
-    if pct is None or round(pct, 1) == 0.0:
+    if pct is None:
         return ""
+    if round(pct, 1) == 0.0:
+        return "unchanged"
     return "better" if pct < 0 else "worse"
 
 
@@ -498,6 +500,7 @@ def generate_html(records: list[RunRecord]):
         short_hash = record.commit.hash[:12]
         commit_url = f"https://github.com/llvm/llvm-project/commit/{record.commit.hash}"
         subject = html.escape(record.commit.subject)
+        subject = re.sub(r"`([^`]+)`", r"<code>\1</code>", subject)
         subject = re.sub(
             r"#(\d+)",
             r'<a href="https://github.com/llvm/llvm-project/pull/\1">#\1</a>',
@@ -586,9 +589,10 @@ def generate_html(records: list[RunRecord]):
     font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
     font-size: 0.8rem;
   }}
-  .better {{ color: #1a7f37; font-weight: 600; }}
+  .better {{ color: #1a9f3b; font-weight: 600; }}
   .worse  {{ color: #cf222e; font-weight: 600; }}
   .failed {{ color: #8b949e; font-style: italic; }}
+  .unchanged {{ color: #8b949e; }}
   .footer {{
     margin-top: 1.2rem; font-size: 0.75rem; color: #8b949e;
   }}
