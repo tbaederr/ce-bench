@@ -339,7 +339,9 @@ def find_bytecode_commits(llvm_repo: Path, limit: int | None = None,
     escaped = COMMIT_PREFIX.replace("[", "\\[").replace("]", "\\]")
     revision = f"{since}..HEAD" if since else "--all"
     cmd = ["git", "log", "--oneline", "--format=%H %s", revision,
-           f"--grep=^{escaped}"]
+           f"--grep=^{escaped}",
+           f'--grep=^Revert "{escaped}',
+           f'--grep=^Reapply "{escaped}']
     if limit is not None:
         cmd.append(f"-{limit}")
 
@@ -514,6 +516,8 @@ def generate_html(records: list[RunRecord]):
         test_map = {t.name: t for t in record.tests}
 
         cells = ""
+        all_zero = True
+        has_delta = False
         for name in test_names:
             t = test_map.get(name)
             if not t or t.failed:
@@ -529,14 +533,52 @@ def generate_html(records: list[RunRecord]):
                 cells += f'<td class="num">{abs_str}</td>'
                 continue
 
+            has_delta = True
             pct = delta_pct(prev, cur)
             css = delta_css_class(pct)
             delta_str = format_delta(prev, cur)
+            if round(pct, 1) != 0.0:
+                all_zero = False
             cells += f'<td class="num">{abs_str} <span class="{css}">({delta_str})</span></td>'
 
-        row_list.append(f"<tr>{commit_cell}{cells}</tr>\n")
+        is_zero = all_zero and has_delta
+        row_list.append((f"<tr>{commit_cell}{cells}</tr>\n", is_zero))
 
-    rows = "".join(reversed(row_list))
+    # Group consecutive all-zero-delta rows and collapse groups > 1.
+    # Rows are oldest-first; we reverse for display (newest on top).
+    reversed_rows = list(reversed(row_list))
+    rows = ""
+    i = 0
+    group_id = 0
+    while i < len(reversed_rows):
+        row_html, is_zero = reversed_rows[i]
+        if not is_zero:
+            rows += row_html
+            i += 1
+            continue
+
+        # Collect consecutive zero-delta rows.
+        group = []
+        while i < len(reversed_rows) and reversed_rows[i][1]:
+            group.append(reversed_rows[i][0])
+            i += 1
+
+        if len(group) == 1:
+            rows += group[0]
+            continue
+
+        # Collapsible group.
+        gid = f"zg{group_id}"
+        group_id += 1
+        toggle_row = (
+            f'<tr class="toggle-row" onclick="toggleGroup(\'{gid}\')">'
+            f'<td colspan="{1 + len(test_names)}" class="toggle-cell">'
+            f'<span id="{gid}-arrow" class="arrow">&#9654;</span> '
+            f'{len(group)} commits with no change</td></tr>\n'
+        )
+        rows += toggle_row
+        for row_html in group:
+            rows += row_html.replace("<tr>", f'<tr class="{gid} collapsed">', 1)
 
     page = f"""\
 <!DOCTYPE html>
@@ -598,6 +640,12 @@ def generate_html(records: list[RunRecord]):
   }}
   .footer a {{ color: #8b949e; }}
   .footer a:hover {{ color: #656d76; }}
+  .collapsed {{ display: none; }}
+  .toggle-row {{ cursor: pointer; }}
+  .toggle-row:hover {{ background: #f6f8fa; }}
+  .toggle-cell {{ color: #656d76; font-size: 0.8rem; }}
+  .arrow {{ font-size: 0.7rem; display: inline-block; transition: transform 0.15s; margin-right: 0.4rem; }}
+  .arrow.open {{ transform: rotate(90deg); }}
 </style>
 </head>
 <body>
@@ -613,12 +661,20 @@ def generate_html(records: list[RunRecord]):
 </table>
 </div>
 <p class="footer"><a href="https://github.com/tbaederr/ce-bench">Source Code</a></p>
+<script>
+function toggleGroup(gid) {{
+  document.querySelectorAll("." + gid).forEach(function(r) {{
+    r.classList.toggle("collapsed");
+  }});
+  document.getElementById(gid + "-arrow").classList.toggle("open");
+}}
+</script>
 </body>
 </html>
 """
 
     REPORT_FILE.write_text(page)
-    print(f"HTML report: {REPORT_FILE}")
+    print(f"HTML report: file://{REPORT_FILE.resolve()}")
 
 
 # ── Entry point ──────────────────────────────────────────────────
