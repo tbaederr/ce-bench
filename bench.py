@@ -180,7 +180,7 @@ def run_benchmarks(clang: str) -> list[TestResult]:
         sys.exit(1)
 
     print(f"Using clang: {clang}")
-    print(f"Found {len(test_files)} test(s), {PERF_REPETITIONS} repetitions each.\n")
+    print(f"Found {len(test_files)} tests, {PERF_REPETITIONS} repetitions each.\n")
 
     results = []
     for test in test_files:
@@ -326,25 +326,13 @@ def sort_by_git_order(llvm_repo: Path, records: list[RunRecord]) -> list[RunReco
 
 # ── LLVM repo queries ───────────────────────────────────────────
 
-INITIAL_COMMIT_COUNT = 3
+INITIAL_COMMIT_COUNT = 25
 COMMIT_PREFIX = "[clang][bytecode]"
+BYTECODE_PATH = "clang/lib/AST/ByteCode"
 
 
-def find_bytecode_commits(llvm_repo: Path, limit: int | None = None,
-                          since: str | None = None) -> list[CommitInfo]:
-    """Find commits with subjects starting with COMMIT_PREFIX.
-
-    If `since` is set, only return commits after that hash.
-    """
-    escaped = COMMIT_PREFIX.replace("[", "\\[").replace("]", "\\]")
-    revision = f"{since}..HEAD" if since else "--all"
-    cmd = ["git", "log", "--oneline", "--format=%H %s", revision,
-           f"--grep=^{escaped}",
-           f'--grep=^Revert "{escaped}',
-           f'--grep=^Reapply "{escaped}']
-    if limit is not None:
-        cmd.append(f"-{limit}")
-
+def _run_git_log(llvm_repo: Path, extra_args: list[str]) -> list[CommitInfo]:
+    cmd = ["git", "log", "--format=%H %s"] + extra_args
     proc = subprocess.run(cmd, cwd=llvm_repo, capture_output=True, text=True)
 
     if proc.returncode != 0:
@@ -359,6 +347,53 @@ def find_bytecode_commits(llvm_repo: Path, limit: int | None = None,
         commits.append(CommitInfo(hash=hash_, subject=subject))
 
     return commits
+
+
+def find_bytecode_commits(llvm_repo: Path, limit: int | None = None,
+                          since: str | None = None) -> list[CommitInfo]:
+    """Find commits by message prefix OR by touching BYTECODE_PATH.
+
+    If `since` is set, only return commits after that hash.
+    """
+    revision = f"{since}..HEAD" if since else "--all"
+
+    # Query 1: commits matching the message patterns.
+    escaped = COMMIT_PREFIX.replace("[", "\\[").replace("]", "\\]")
+    grep_args = [revision,
+                 f"--grep=^{escaped}",
+                 f'--grep=^Revert "{escaped}',
+                 f'--grep=^Reapply "{escaped}']
+
+    # Query 2: commits touching the bytecode directory.
+    path_args = [revision, "--", BYTECODE_PATH]
+
+    grep_commits = _run_git_log(llvm_repo, grep_args)
+    path_commits = _run_git_log(llvm_repo, path_args)
+
+    # Merge, deduplicate, preserve git log order (newest first).
+    seen = set()
+    merged = []
+    for c in grep_commits + path_commits:
+        if c.hash not in seen:
+            seen.add(c.hash)
+            merged.append(c)
+
+    # Re-sort by git history order (newest first).
+    if merged:
+        hashes = [c.hash for c in merged]
+        proc = subprocess.run(
+            ["git", "log", "--format=%H", "--no-walk", *hashes],
+            cwd=llvm_repo, capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            order = proc.stdout.strip().splitlines()
+            by_hash = {c.hash: c for c in merged}
+            merged = [by_hash[h] for h in order if h in by_hash]
+
+    if limit is not None:
+        merged = merged[:limit]
+
+    return merged
 
 
 def find_newest_result(llvm_repo: Path) -> str:
@@ -650,7 +685,7 @@ def generate_html(records: list[RunRecord]):
 </head>
 <body>
 <h1>Bytecode Interpreter Benchmark</h1>
-<p class="subtitle">instructions:u delta between consecutive commits</p>
+<p class="subtitle">instructions:u delta between consecutive commits &middot; {len(records)} commits</p>
 <div class="table-wrap">
 <table>
 <thead>
@@ -683,11 +718,13 @@ def built_clang_path(llvm_repo: Path) -> str:
     return str(llvm_repo / "build" / "bin" / "clang")
 
 
-def run_for_commit(commit: CommitInfo, llvm_repo: Path):
+def run_for_commit(commit: CommitInfo, llvm_repo: Path,
+                    current: int = 0, total: int = 0):
     """Checkout a commit, build clang, run benchmarks, save results."""
     short = commit.hash[:12]
+    progress = f" ({current} of {total})" if total else ""
     print(f"\n{'#' * 66}")
-    print(f"# {short} — {commit.subject}")
+    print(f"# {short} — {commit.subject}{progress}")
     print(f"{'#' * 66}\n")
 
     checkout_commit(llvm_repo, commit.hash)
@@ -734,8 +771,9 @@ def main():
             for c in new_commits:
                 print(f"  {c.hash[:12]} {c.subject}")
             print()
-            for commit in reversed(new_commits):
-                run_for_commit(commit, llvm_repo)
+            ordered = list(reversed(new_commits))
+            for i, commit in enumerate(ordered, 1):
+                run_for_commit(commit, llvm_repo, current=i, total=len(ordered))
         else:
             print("No new commits to benchmark.")
 
