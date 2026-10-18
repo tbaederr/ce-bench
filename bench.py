@@ -504,12 +504,13 @@ def delta_css_class(pct: float | None) -> str:
 
 
 def collect_test_names(records: list[RunRecord]) -> list[str]:
-    """Gather all unique test names across runs, in stable order."""
+    """Gather unique test names that still have a file in tests/."""
+    existing = {p.stem for p in TESTS_DIR.glob("*.cpp")}
     seen = set()
     names = []
     for r in records:
         for t in r.tests:
-            if t.name not in seen:
+            if t.name not in seen and t.name in existing:
                 seen.add(t.name)
                 names.append(t.name)
     return names
@@ -530,22 +531,28 @@ def generate_html(records: list[RunRecord]):
     # so we can compute deltas between consecutive commits.
     # prev_instructions[test_name] = instruction count from the previous commit.
     prev_instructions: dict[str, float] = {}
+    md_summaries: dict[str, str] = {}
+
+    COPY_ICON = (
+        '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="2">'
+        '<rect x="9" y="9" width="13" height="13" rx="2"/>'
+        '<path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>'
+        '</svg>'
+    )
 
     # Build rows oldest-first, then reverse for display (most recent on top).
     row_list = []
     for record in records:
         short_hash = record.commit.hash[:12]
         commit_url = f"https://github.com/llvm/llvm-project/commit/{record.commit.hash}"
-        subject = html.escape(record.commit.subject)
+        raw_subject = record.commit.subject
+        subject = html.escape(raw_subject)
         subject = re.sub(r"`([^`]+)`", r"<code>\1</code>", subject)
         subject = re.sub(
             r"#(\d+)",
             r'<a href="https://github.com/llvm/llvm-project/pull/\1">#\1</a>',
             subject,
-        )
-        commit_cell = (
-            f'<td><a href="{commit_url}"><code>{html.escape(short_hash)}</code></a> '
-            f'{subject}</td>'
         )
 
         test_map = {t.name: t for t in record.tests}
@@ -553,10 +560,12 @@ def generate_html(records: list[RunRecord]):
         cells = ""
         all_zero = True
         has_delta = False
+        md_test_rows = []
         for name in test_names:
             t = test_map.get(name)
             if not t or t.failed:
                 cells += '<td class="num failed">—</td>'
+                md_test_rows.append((name, "—", ""))
                 continue
 
             cur = t.result.events.get("instructions:u", 0)
@@ -566,6 +575,7 @@ def generate_html(records: list[RunRecord]):
             abs_str = format_value(cur)
             if prev is None or prev == 0:
                 cells += f'<td class="num">{abs_str}</td>'
+                md_test_rows.append((name, abs_str, ""))
                 continue
 
             has_delta = True
@@ -575,6 +585,34 @@ def generate_html(records: list[RunRecord]):
             if round(pct, 1) != 0.0:
                 all_zero = False
             cells += f'<td class="num">{abs_str} <span class="{css}">({delta_str})</span></td>'
+            md_test_rows.append((name, abs_str, delta_str))
+
+        # Markdown summary for clipboard.
+        any_delta = any(d for _, _, d in md_test_rows)
+        md_lines = []
+        if any_delta:
+            md_lines.append("| Test | Instructions | Delta |")
+            md_lines.append("|------|-------------|-------|")
+            for tname, tval, tdelta in md_test_rows:
+                tlink = f"[{tname}]({TESTS_BASE_URL}/{tname}.cpp)"
+                md_lines.append(f"| {tlink} | {tval} | {tdelta} |")
+        else:
+            md_lines.append("| Test | Instructions |")
+            md_lines.append("|------|-------------|")
+            for tname, tval, _ in md_test_rows:
+                tlink = f"[{tname}]({TESTS_BASE_URL}/{tname}.cpp)"
+                md_lines.append(f"| {tlink} | {tval} |")
+        md_summaries[short_hash] = "\n".join(md_lines)
+
+        commit_cell = (
+            f'<td>'
+            f'<a href="{commit_url}"><code>{html.escape(short_hash)}</code></a> '
+            f'{subject} '
+            f'<button class="copy-btn" data-hash="{short_hash}" '
+            f'onclick="copyMd(this)" title="Copy markdown summary">'
+            f'{COPY_ICON}</button>'
+            f'</td>'
+        )
 
         is_zero = all_zero and has_delta
         row_list.append((f"<tr>{commit_cell}{cells}</tr>\n", is_zero))
@@ -614,6 +652,8 @@ def generate_html(records: list[RunRecord]):
         rows += toggle_row
         for row_html in group:
             rows += row_html.replace("<tr>", f'<tr class="{gid} collapsed">', 1)
+
+    md_json = json.dumps(md_summaries)
 
     page = f"""\
 <!DOCTYPE html>
@@ -681,6 +721,13 @@ def generate_html(records: list[RunRecord]):
   .toggle-cell {{ color: #656d76; font-size: 0.8rem; }}
   .arrow {{ font-size: 0.7rem; display: inline-block; transition: transform 0.15s; margin-right: 0.4rem; }}
   .arrow.open {{ transform: rotate(90deg); }}
+  .copy-btn {{
+    background: none; border: none;
+    color: #656d76; cursor: pointer; padding: 2px 4px;
+    margin-left: 0.4rem; vertical-align: middle; line-height: 1;
+  }}
+  .copy-btn:hover {{ background: #f6f8fa; color: #1f2328; }}
+  .copy-btn.copied {{ color: #1a9f3b; }}
 </style>
 </head>
 <body>
@@ -697,11 +744,22 @@ def generate_html(records: list[RunRecord]):
 </div>
 <p class="footer"><a href="https://github.com/tbaederr/ce-bench">Source Code</a></p>
 <script>
+var mdSummaries = {md_json};
+
 function toggleGroup(gid) {{
   document.querySelectorAll("." + gid).forEach(function(r) {{
     r.classList.toggle("collapsed");
   }});
   document.getElementById(gid + "-arrow").classList.toggle("open");
+}}
+
+function copyMd(btn) {{
+  var md = mdSummaries[btn.dataset.hash];
+  if (!md) return;
+  navigator.clipboard.writeText(md).then(function() {{
+    btn.classList.add("copied");
+    setTimeout(function() {{ btn.classList.remove("copied"); }}, 1500);
+  }});
 }}
 </script>
 </body>
