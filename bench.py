@@ -16,6 +16,7 @@ import json
 import re
 import shlex
 import subprocess
+import urllib.request
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -490,6 +491,156 @@ def build_clang(llvm_repo: Path):
     print(" done.")
 
 
+# ── PR check ────────────────────────────────────────────────────
+
+GITHUB_PR_URL_RE = re.compile(
+    r'https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)'
+)
+
+
+def parse_pr_url(url: str) -> tuple[str, int]:
+    """Extract (owner/repo, pr_number) from a GitHub PR URL."""
+    m = GITHUB_PR_URL_RE.match(url)
+    if not m:
+        print(f"Error: invalid PR URL: {url}", file=sys.stderr)
+        sys.exit(1)
+    return m.group(1), int(m.group(2))
+
+
+def download_patch(repo_slug: str, pr_number: int) -> str:
+    url = f"https://github.com/{repo_slug}/pull/{pr_number}.patch"
+    print(f"Downloading patch for PR #{pr_number} ...", end="", flush=True)
+    try:
+        with urllib.request.urlopen(url) as resp:
+            patch = resp.read().decode()
+    except Exception as e:
+        print(f" FAILED", file=sys.stderr)
+        print(f"  {e}", file=sys.stderr)
+        sys.exit(1)
+    print(" done.")
+    return patch
+
+
+def apply_patch(llvm_repo: Path, patch: str):
+    print("  Applying patch ...", end="", flush=True)
+    proc = subprocess.run(
+        ["git", "apply", "-"],
+        input=patch,
+        cwd=llvm_repo,
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(" FAILED", file=sys.stderr)
+        print(proc.stderr.strip(), file=sys.stderr)
+        sys.exit(1)
+    print(" done.")
+
+
+def revert_patch(llvm_repo: Path, patch: str):
+    print("  Reverting patch ...", end="", flush=True)
+    proc = subprocess.run(
+        ["git", "apply", "-R", "-"],
+        input=patch,
+        cwd=llvm_repo,
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(" FAILED (manual cleanup may be needed)", file=sys.stderr)
+    else:
+        print(" done.")
+
+
+def get_head_commit(llvm_repo: Path) -> CommitInfo:
+    proc = subprocess.run(
+        ["git", "log", "-1", "--format=%H %s"],
+        cwd=llvm_repo,
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(f"git log failed: {proc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    line = proc.stdout.strip()
+    hash_, subject = line.split(" ", 1)
+    return CommitInfo(hash=hash_, subject=subject)
+
+
+def load_result(commit_hash: str) -> RunRecord:
+    path = RESULTS_DIR / f"{commit_hash}.json"
+    data = json.loads(path.read_text())
+    tests = []
+    for t in data.get("tests", []):
+        tests.append(TestResult(
+            name=t["name"],
+            result=PerfResult(events=t.get("events", {}),
+                              wall_seconds=t.get("wall_seconds", 0)),
+            failed=t.get("failed", False),
+        ))
+    commit = CommitInfo(hash=data.get("commit", path.stem),
+                        subject=data.get("subject", ""))
+    return RunRecord(commit=commit, clang=data.get("clang", ""),
+                     repetitions=data.get("repetitions", 0), tests=tests)
+
+
+def print_check_results(baseline: RunRecord, pr_tests: list[TestResult],
+                        pr_number: int):
+    baseline_map = {t.name: t for t in baseline.tests}
+
+    print(f"\n{'=' * 66}")
+    print(f"  PR #{pr_number} vs main ({baseline.commit.hash[:12]})")
+    print(f"{'=' * 66}\n")
+
+    print(f"  {'Test':<20} {'Main':>14} {'PR':>14} {'Delta':>10}")
+    print(f"  {'-' * 20} {'-' * 14} {'-' * 14} {'-' * 10}")
+
+    for t in pr_tests:
+        if t.failed:
+            print(f"  {t.name:<20} {'':>14} {'FAILED':>14} {'':>10}")
+            continue
+
+        pr_instr = t.result.events.get("instructions:u", 0)
+        base_t = baseline_map.get(t.name)
+        if not base_t or base_t.failed:
+            print(f"  {t.name:<20} {'':>14} {format_value(pr_instr):>14} {'':>10}")
+            continue
+
+        base_instr = base_t.result.events.get("instructions:u", 0)
+        delta = format_delta(base_instr, pr_instr)
+        print(f"  {t.name:<20} {format_value(base_instr):>14} {format_value(pr_instr):>14} {delta:>10}")
+
+    print()
+
+
+def run_check(llvm_repo: Path, pr_url: str):
+    repo_slug, pr_number = parse_pr_url(pr_url)
+    patch = download_patch(repo_slug, pr_number)
+
+    update_repo(llvm_repo)
+    main_head = get_head_commit(llvm_repo)
+
+    # Benchmark main HEAD as baseline if needed.
+    if not result_exists(main_head.hash):
+        print(f"\nBenchmarking main ({main_head.hash[:12]}) as baseline ...")
+        build_clang(llvm_repo)
+        clang = built_clang_path(llvm_repo)
+        results = run_benchmarks(clang)
+        record = RunRecord(commit=main_head, clang=clang,
+                           repetitions=PERF_REPETITIONS, tests=results)
+        save_results(record)
+
+    baseline = load_result(main_head.hash)
+
+    # Apply patch, build, benchmark, then revert.
+    apply_patch(llvm_repo, patch)
+    try:
+        build_clang(llvm_repo)
+        clang = built_clang_path(llvm_repo)
+        pr_results = run_benchmarks(clang)
+    finally:
+        revert_patch(llvm_repo, patch)
+
+    print_check_results(baseline, pr_results, pr_number)
+
+
 # ── HTML report ──────────────────────────────────────────────────
 
 REPORT_FILE = SCRIPT_DIR / "report.html"
@@ -799,6 +950,8 @@ def main():
     parser = argparse.ArgumentParser(description="Constexpr interpreter benchmarks")
     parser.add_argument("--update", action="store_true",
                         help="Update the llvm repo and run benchmarks for new commits")
+    parser.add_argument("--check", metavar="PR_URL",
+                        help="Benchmark a GitHub PR against main")
     args = parser.parse_args()
 
     config = load_settings()
@@ -834,6 +987,9 @@ def main():
                 run_for_commit(commit, llvm_repo, current=i, total=len(ordered))
         else:
             print("No new commits to benchmark.")
+
+    if args.check:
+        run_check(llvm_repo, args.check)
 
     all_records = load_all_results()
     all_records = sort_by_git_order(llvm_repo, all_records)
