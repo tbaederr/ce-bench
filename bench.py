@@ -582,11 +582,11 @@ def load_result(commit_hash: str) -> RunRecord:
 
 
 def print_check_results(baseline: RunRecord, pr_tests: list[TestResult],
-                        pr_number: int):
+                        label: str):
     baseline_map = {t.name: t for t in baseline.tests}
 
     print(f"\n{'=' * 66}")
-    print(f"  PR #{pr_number} vs main ({baseline.commit.hash[:12]})")
+    print(f"  {label} vs main ({baseline.commit.hash[:12]})")
     print(f"{'=' * 66}\n")
 
     print(f"  {'Test':<20} {'Main':>14} {'PR':>14} {'Delta':>10}")
@@ -610,24 +610,71 @@ def print_check_results(baseline: RunRecord, pr_tests: list[TestResult],
     print()
 
 
-def run_check(llvm_repo: Path, pr_url: str):
-    repo_slug, pr_number = parse_pr_url(pr_url)
+def print_check_markdown(baseline: RunRecord, pr_tests: list[TestResult]):
+    """Print a markdown table for pasting into a PR comment."""
+    TESTS_BASE_URL = "https://github.com/tbaederr/ce-bench/tree/main/tests"
+    baseline_map = {t.name: t for t in baseline.tests}
+
+    lines = [
+        "| Test | Instructions | Delta |",
+        "|------|-------------|-------|",
+    ]
+
+    for t in pr_tests:
+        tlink = f"[{t.name}]({TESTS_BASE_URL}/{t.name}.cpp)"
+
+        if t.failed:
+            lines.append(f"| {tlink} | — | |")
+            continue
+
+        pr_instr = t.result.events.get("instructions:u", 0)
+        pr_str = format_value(pr_instr)
+        base_t = baseline_map.get(t.name)
+
+        if not base_t or base_t.failed:
+            lines.append(f"| {tlink} | {pr_str} | |")
+            continue
+
+        base_instr = base_t.result.events.get("instructions:u", 0)
+        delta = format_delta(base_instr, pr_instr)
+        lines.append(f"| {tlink} | {pr_str} | {delta} |")
+
+    md = "\n".join(lines)
+    print("Markdown summary:\n")
+    print(md)
+    print()
+
+
+def load_patch(source: str) -> tuple[str, str]:
+    """Return (patch_content, display_label) from a PR URL or local file."""
+    patch_path = Path(source)
+    if patch_path.is_file():
+        print(f"Reading patch from {patch_path} ...", end="", flush=True)
+        patch = patch_path.read_text()
+        print(" done.")
+        return patch, patch_path.name
+
+    repo_slug, pr_number = parse_pr_url(source)
     patch = download_patch(repo_slug, pr_number)
+    return patch, f"PR #{pr_number}"
+
+
+def run_check(llvm_repo: Path, source: str):
+    patch, label = load_patch(source)
 
     update_repo(llvm_repo)
     main_head = get_head_commit(llvm_repo)
 
-    # Benchmark main HEAD as baseline if needed.
-    if not result_exists(main_head.hash):
+    # Reuse existing result if available, otherwise benchmark without saving.
+    if result_exists(main_head.hash):
+        baseline = load_result(main_head.hash)
+    else:
         print(f"\nBenchmarking main ({main_head.hash[:12]}) as baseline ...")
         build_clang(llvm_repo)
         clang = built_clang_path(llvm_repo)
         results = run_benchmarks(clang)
-        record = RunRecord(commit=main_head, clang=clang,
-                           repetitions=PERF_REPETITIONS, tests=results)
-        save_results(record)
-
-    baseline = load_result(main_head.hash)
+        baseline = RunRecord(commit=main_head, clang=clang,
+                             repetitions=PERF_REPETITIONS, tests=results)
 
     # Apply patch, build, benchmark, then revert.
     apply_patch(llvm_repo, patch)
@@ -638,7 +685,8 @@ def run_check(llvm_repo: Path, pr_url: str):
     finally:
         revert_patch(llvm_repo, patch)
 
-    print_check_results(baseline, pr_results, pr_number)
+    print_check_results(baseline, pr_results, label)
+    print_check_markdown(baseline, pr_results)
 
 
 # ── HTML report ──────────────────────────────────────────────────
@@ -950,8 +998,8 @@ def main():
     parser = argparse.ArgumentParser(description="Constexpr interpreter benchmarks")
     parser.add_argument("--update", action="store_true",
                         help="Update the llvm repo and run benchmarks for new commits")
-    parser.add_argument("--check", metavar="PR_URL",
-                        help="Benchmark a GitHub PR against main")
+    parser.add_argument("--check", metavar="PR_URL_OR_PATCH",
+                        help="Benchmark a GitHub PR or local .patch file against main")
     args = parser.parse_args()
 
     config = load_settings()
