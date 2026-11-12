@@ -19,6 +19,7 @@ import subprocess
 import urllib.request
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
@@ -39,7 +40,17 @@ EVENTS_OF_INTEREST = [
     "branch-misses:u",
 ]
 
+BRANCHES_EVENT = "branches:u"
+BRANCH_MISSES_EVENT = "branch-misses:u"
+
 INTERP_FLAG = "-fexperimental-new-constant-interpreter"
+CURRENT_INTERP_FLAG = "-fno-experimental-new-constant-interpreter"
+
+
+class Interpreter(Enum):
+    """Which constant evaluator clang uses."""
+    BYTECODE = INTERP_FLAG
+    CURRENT = CURRENT_INTERP_FLAG
 
 
 def load_settings() -> configparser.ConfigParser:
@@ -174,7 +185,8 @@ class TestResult:
     failed: bool = False
 
 
-def run_benchmarks(clang: str) -> list[TestResult]:
+def run_benchmarks(clang: str,
+                   interpreter: Interpreter = Interpreter.BYTECODE) -> list[TestResult]:
     test_files = sorted(TESTS_DIR.glob("*.cpp"))
     if not test_files:
         print("No .cpp files found in tests/", file=sys.stderr)
@@ -190,7 +202,7 @@ def run_benchmarks(clang: str) -> list[TestResult]:
 
         extra_args = read_extra_args(test)
         cmd = [clang, "-c", str(test), "-o", "/dev/null", "-std=c++20",
-               "-fconstexpr-steps=0", INTERP_FLAG] + extra_args
+               "-fconstexpr-steps=0", interpreter.value] + extra_args
 
         print(f"  Running ...", end="", flush=True)
         result = run_perf(cmd)
@@ -216,7 +228,14 @@ def print_terminal_table(result: PerfResult):
         val = result.events.get(event, 0)
         if val == 0:
             continue
-        print(f"  {event:<20} {format_value(val):>12}")
+        line = f"  {event:<20} {format_value(val):>12}"
+
+        # Append miss rate, e.g. "branch-misses:u  1.23M  (2.1%)".
+        branches = result.events.get(BRANCHES_EVENT, 0)
+        if event == BRANCH_MISSES_EVENT and branches:
+            line += f"  ({val / branches * 100:.1f}%)"
+
+        print(line)
 
     if result.wall_seconds:
         print(f"\n  Wall time: {result.wall_seconds:.3f}s")
@@ -250,7 +269,16 @@ def save_results(record: RunRecord):
     RESULTS_DIR.mkdir(exist_ok=True)
     path = RESULTS_DIR / f"{record.commit.hash}.json"
 
-    data = {
+    path.write_text(json.dumps(record_to_dict(record), indent=2))
+    print(f"Results saved: {path}")
+
+
+# Kept outside RESULTS_DIR so it isn't treated as a bytecode run.
+CURRENT_INTERP_FILE = SCRIPT_DIR / "current-interp.json"
+
+
+def record_to_dict(record: RunRecord) -> dict:
+    return {
         "commit": record.commit.hash,
         "subject": record.commit.subject,
         "clang": record.clang,
@@ -266,8 +294,16 @@ def save_results(record: RunRecord):
         ],
     }
 
-    path.write_text(json.dumps(data, indent=2))
-    print(f"Results saved: {path}")
+
+def save_current_interp(record: RunRecord):
+    CURRENT_INTERP_FILE.write_text(json.dumps(record_to_dict(record), indent=2))
+    print(f"Current interpreter results saved: {CURRENT_INTERP_FILE}")
+
+
+def load_current_interp() -> RunRecord | None:
+    if not CURRENT_INTERP_FILE.exists():
+        return None
+    return load_result_file(CURRENT_INTERP_FILE)
 
 
 def load_all_results() -> list[RunRecord]:
@@ -565,7 +601,10 @@ def get_head_commit(llvm_repo: Path) -> CommitInfo:
 
 
 def load_result(commit_hash: str) -> RunRecord:
-    path = RESULTS_DIR / f"{commit_hash}.json"
+    return load_result_file(RESULTS_DIR / f"{commit_hash}.json")
+
+
+def load_result_file(path: Path) -> RunRecord:
     data = json.loads(path.read_text())
     tests = []
     for t in data.get("tests", []):
@@ -647,7 +686,7 @@ def print_check_markdown(baseline: RunRecord, pr_tests: list[TestResult]):
 
 def load_patch(source: str) -> tuple[str, str]:
     """Return (patch_content, display_label) from a PR URL or local file."""
-    patch_path = Path(source)
+    patch_path = Path(source).expanduser()
     if patch_path.is_file():
         print(f"Reading patch from {patch_path} ...", end="", flush=True)
         patch = patch_path.read_text()
@@ -715,8 +754,49 @@ def collect_test_names(records: list[RunRecord]) -> list[str]:
     return names
 
 
-def generate_html(records: list[RunRecord]):
+def build_interp_comparison(records: list[RunRecord],
+                            current: RunRecord | None) -> str:
+    """One-line HTML summary: current interpreter vs. bytecode instructions per test.
+
+    e.g. "Current → bytecode @ 813763f: arithmetic 1.20M → 0.90M (-25.0%) · ..."
+    Bytecode numbers come from the record with the same commit.
+    """
+    if not current:
+        return ""
+
+    bytecode = next((r for r in records if r.commit.hash == current.commit.hash), None)
+    if not bytecode:
+        return ""
+
+    bytecode_map = {t.name: t for t in bytecode.tests}
+    existing = {p.stem for p in TESTS_DIR.glob("*.cpp")}
+
+    items = []
+    for t in current.tests:
+        if t.name not in existing:
+            continue
+
+        name = html.escape(t.name)
+        b = bytecode_map.get(t.name)
+        if t.failed or not b or b.failed:
+            items.append(f'{name} <span class="failed">—</span>')
+            continue
+
+        cur = t.result.events.get("instructions:u", 0)
+        bc = b.result.events.get("instructions:u", 0)
+        pct = delta_pct(cur, bc)
+        items.append(f'{name} <span class="num">{format_value(cur)} &rarr; {format_value(bc)}</span> '
+                     f'<span class="num {delta_css_class(pct)}">({format_delta(cur, bc)})</span>')
+
+    short_hash = html.escape(current.commit.hash[:12])
+    return (f'<p class="compare" title="instructions:u; delta is bytecode relative to current">'
+            f'<strong>Current &rarr; bytecode</strong> @ <code>{short_hash}</code>: '
+            f'{" &middot; ".join(items)}</p>\n')
+
+
+def generate_html(records: list[RunRecord], current: RunRecord | None = None):
     test_names = collect_test_names(records)
+    comparison = build_interp_comparison(records, current)
 
     # Header row: Commit | test1 | test2 | ...
     TESTS_BASE_URL = "https://github.com/tbaederr/ce-bench/tree/main/tests"
@@ -878,6 +958,12 @@ def generate_html(records: list[RunRecord]):
   .subtitle {{
     color: #656d76; font-size: 0.8rem; margin-bottom: 1.5rem;
   }}
+  .compare {{ margin: 0 0 1rem 0; }}
+  .compare code {{
+    background: #eff1f3; padding: 0.15rem 0.4rem;
+    border-radius: 4px; font-size: 0.8em;
+    font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
+  }}
   .table-wrap {{
     background: #fff; border: 1px solid #d0d7de; border-radius: 6px;
     overflow-x: auto;
@@ -931,7 +1017,7 @@ def generate_html(records: list[RunRecord]):
 </head>
 <body>
 <h1>Bytecode Interpreter Benchmark</h1>
-<p class="subtitle">instructions:u delta between consecutive commits &middot; {len(records)} commits</p>
+{comparison}<p class="subtitle">instructions:u delta between consecutive commits &middot; {len(records)} commits</p>
 <div class="table-wrap">
 <table>
 <thead>
@@ -994,6 +1080,24 @@ def run_for_commit(commit: CommitInfo, llvm_repo: Path,
     save_results(record)
 
 
+def run_current_interp(llvm_repo: Path):
+    """Benchmark the current interpreter at the newest bytecode-tested commit."""
+    newest_hash = find_newest_result(llvm_repo)
+    if not newest_hash:
+        return
+
+    commit = load_result(newest_hash).commit
+    print(f"\nBenchmarking current interpreter at {commit.hash[:12]} ...")
+
+    checkout_commit(llvm_repo, commit.hash)
+    build_clang(llvm_repo)
+
+    clang = built_clang_path(llvm_repo)
+    results = run_benchmarks(clang, Interpreter.CURRENT)
+    save_current_interp(RunRecord(commit=commit, clang=clang,
+                                  repetitions=PERF_REPETITIONS, tests=results))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Constexpr interpreter benchmarks")
     parser.add_argument("--update", action="store_true",
@@ -1036,12 +1140,14 @@ def main():
         else:
             print("No new commits to benchmark.")
 
+        run_current_interp(llvm_repo)
+
     if args.check:
         run_check(llvm_repo, args.check)
 
     all_records = load_all_results()
     all_records = sort_by_git_order(llvm_repo, all_records)
-    generate_html(all_records)
+    generate_html(all_records, load_current_interp())
 
 
 if __name__ == "__main__":
